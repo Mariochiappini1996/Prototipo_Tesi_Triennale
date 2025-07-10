@@ -18,7 +18,7 @@ import ipaddress
 import socket
 import html
 from types import ModuleType
-import time # Importato per il join del thread
+import time
 
 # ... (Hack per modulo cgi) ...
 if "cgi" not in sys.modules:
@@ -225,12 +225,21 @@ class P2PNode:
 
         try:
             while not reader.at_eof():
-                data = await reader.readline()
+                # 1. Leggi l'header di lunghezza fissa (10 byte)
+                header_data = await reader.readexactly(10)
+                if not header_data:
+                    break
+                
+                # 2. Estrai la lunghezza del messaggio
+                message_length = int(header_data.decode().strip())
+                
+                # 3. Leggi esattamente quel numero di byte per ottenere il messaggio
+                data = await reader.readexactly(message_length)
                 if not data:
                     break
+                    
                 message = data.decode().strip()
                 if message and self._on_message:
-                    # Passa writer per identificare la fonte
                     self._on_message(message, writer)
             logging.info(f"Connessione chiusa da Peer-{peer_uuid} ({peername})")
         except asyncio.CancelledError:
@@ -255,13 +264,19 @@ class P2PNode:
                 self._on_disconnect(writer, peername, stored_uuid)
 
     async def send_message(self, message, target_writer=None):
-        # ... (log aggiornati per usare UUID) ...
         writers_to_send = [target_writer] if target_writer else list(self.connections.keys())
         for writer in writers_to_send:
             peer_uuid = self._get_peer_uuid(writer)
             if writer and not writer.is_closing():
                 try:
-                    writer.write((message + "\n").encode())
+                    # 1. Codifica il messaggio in byte
+                    message_bytes = message.encode()
+                    
+                    # 2. Crea un header di lunghezza fissa (10 byte)
+                    header = f"{len(message_bytes):<10}".encode()
+                    
+                    # 3. Invia prima l'header, poi il messaggio
+                    writer.write(header + message_bytes)
                     await writer.drain()
                 except ConnectionResetError:
                      logging.warning(f"Impossibile inviare a Peer-{peer_uuid}, connessione resettata: {writer.get_extra_info('peername')}")
@@ -312,7 +327,7 @@ class P2PNode:
             if writer: writer.close()
             raise
 
-    # ... (set_on_message_callback, etc. invariati) ...
+
     def set_on_message_callback(self, callback):
         self._on_message = callback
     def set_on_connect_callback(self, callback):
@@ -410,35 +425,28 @@ def process_file_attachment(filepath):
         MAX_FILE_SIZE = 50 * 1024 * 1024 # 50 MB
         if file_size > MAX_FILE_SIZE:
              raise ValueError(f"File troppo grande ({file_size / 1024 / 1024:.2f} MB). Massimo: {MAX_FILE_SIZE / 1024 / 1024} MB")
+        # Leggi sempre il file in modalità binaria per una gestione robusta
+        with open(filepath, "rb") as f:
+            binary_content = f.read()
 
+        # Codifica i dati binari in Base64
+        encoded_data = base64.b64encode(binary_content).decode("utf-8")
+
+        # Tenta la traduzione solo se è un file di testo e il traduttore è disponibile
         if mimetype.startswith("text") and TRANSLATOR_AVAILABLE:
-            with open(filepath, "rb") as f: raw_content = f.read()
-            try: content = raw_content.decode('utf-8')
+            try:
+                # Prova a decodificare il contenuto per la traduzione
+                text_content = binary_content.decode('utf-8')
+                translation = translate_text(text_content, dest_language='en')
             except UnicodeDecodeError:
-                try: content = raw_content.decode('latin-1')
-                except UnicodeDecodeError:
-                    logging.warning(f"Impossibile decodificare il file di testo {filename} per la traduzione.")
-                    encoded = base64.b64encode(raw_content).decode("utf-8")
-                    mimetype = "application/octet-stream"
-                    content = None
-            if content:
-                encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-                translation = translate_text(content, dest_language='en')
-            # Se 'content' è None a causa di errore decode, 'encoded' è già stato impostato
-            elif mimetype == "application/octet-stream": # Assicurati che encoded sia impostato se la decodifica fallisce
-                 pass # encoded è già stato impostato sopra
-            else: # Caso imprevisto
-                 raise Exception("Errore logico nel processing file di testo")
-
-        else: # File binari o testo senza traduttore
-            with open(filepath, "rb") as f: binary_content = f.read()
-            encoded = base64.b64encode(binary_content).decode("utf-8")
-            translation = None
+                logging.warning(f"Impossibile decodificare il file di testo {filename} per la traduzione. Verrà inviato come binario.")
+            except Exception as e:
+                logging.error(f"Errore durante la traduzione del file {filename}: {e}")
 
         return {
             "filename": filename,
             "mimetype": mimetype,
-            "data": encoded,
+            "data": encoded_data, # Usa sempre i dati binari codificati
             "translation": translation
         }
     except FileNotFoundError:
@@ -467,7 +475,7 @@ class ChatWidget(QtWidgets.QWidget):
         # {writer: {"public_key": key, "ratchet": ratchet, "peer_id": ip:port, "uuid": str}}
         self.peer_crypto_info = {}
         self.current_writer = None # Writer del peer attivo
-
+        self.pending_files = {}
         self.username = f"User_{uuid.uuid4().hex[:6]}"
 
         # ... (typing timer) ...
@@ -515,7 +523,19 @@ class ChatWidget(QtWidgets.QWidget):
         main_layout.addWidget(connection_frame)
 
         # --- Area Chat ---
-        self.chat_area = QtWidgets.QTextEdit(self); self.chat_area.setReadOnly(True); self.chat_area.setObjectName("chatArea")
+        self.chat_area = QtWidgets.QTextBrowser(self) 
+        self.chat_area.setReadOnly(True)
+        self.chat_area.setObjectName("chatArea")
+        
+        self.chat_area.document().setDefaultStyleSheet("""
+            a { color: #87CEEB; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+        """)
+
+
+        self.chat_area.setOpenExternalLinks(False)
+        self.chat_area.anchorClicked.connect(self.handle_anchor_click)
+        
         main_layout.addWidget(self.chat_area, stretch=1)
 
         # --- Stato "typing" ---
@@ -536,6 +556,36 @@ class ChatWidget(QtWidgets.QWidget):
 
         self.setLayout(main_layout)
 
+    @QtCore.pyqtSlot(QtCore.QUrl)
+    def handle_anchor_click(self, url):
+        print(f"DEBUG: Link cliccato! L'URL ricevuto è: {url.toString()}")
+        file_uuid = url.toString()
+        if file_uuid in self.pending_files:
+            file_info = self.pending_files.pop(file_uuid) # Rimuovi per evitare salvataggi multipli
+            filename = file_info['filename']
+            base64_data = file_info['data']
+
+            # Apri la finestra di dialogo per salvare il file
+            options = QtWidgets.QFileDialog.Options()
+            save_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Salva Allegato",
+                filename, # Nome del file suggerito
+                "Tutti i file (*)",
+                options=options
+            )
+
+            if save_path:
+                try:
+                    # Decodifica da Base64 e scrivi il file binario
+                    file_data = base64.b64decode(base64_data)
+                    with open(save_path, "wb") as f:
+                        f.write(file_data)
+                    self.display_message(f"File '{filename}' salvato correttamente in: {save_path}", "info")
+                except Exception as e:
+                    logging.error(f"Errore nel salvataggio del file {filename}: {e}")
+                    QtWidgets.QMessageBox.critical(self, "Errore di Salvataggio", f"Impossibile salvare il file.\n{e}")
+    
     def apply_theme(self):
         # ... (definizione colori e stili QSS) ...
         dark_electric_blue = "#3a86ff"; dark_hover_blue = "#5a9bff"
@@ -597,8 +647,7 @@ class ChatWidget(QtWidgets.QWidget):
             html_content = html_content.replace(f"background-color:{light_bubble_sent_bg}", f"background-color:{dark_bubble_sent_bg}")
             html_content = html_content.replace(f"background-color:{light_bubble_recv_bg}", f"background-color:{dark_bubble_recv_bg}")
             html_content = html_content.replace(f"background-color:{attachment_bg_light}", f"background-color:{attachment_bg_dark}") # Aggiorna attach bg
-            # Aggiorna colori testo (più robusto cercando specifici tag/stili se necessario)
-            # Questo replace semplice potrebbe cambiare colori indesiderati se sono uguali
+            # Aggiorna colori testo
             html_content = html_content.replace(f"color:{light_bubble_text}", f"color:{dark_bubble_text}") # Sent bubble text
             html_content = html_content.replace(f"color:{light_bubble_recv_text}", f"color:{dark_bubble_text}") # Received bubble text
             html_content = html_content.replace(f"color:{light_bubble_info_text}", f"color:{dark_bubble_info_text}") # Info text
@@ -614,11 +663,15 @@ class ChatWidget(QtWidgets.QWidget):
         self.chat_area.verticalScrollBar().setValue(self.chat_area.verticalScrollBar().maximum())
 
 
-    # --- Metodo aggiornato per bolle moderne con contorno, font morbido e timestamp affiancato ---
+    # --- Metodo per bolle moderne con contorno, font morbido e timestamp affiancato ---
     def display_message(self, text, mtype, peer_display_id="Peer"):
         # Ora corrente
         time_str = QtCore.QTime.currentTime().toString("hh:mm")
-        escaped_text = html.escape(text)
+        if mtype in ("attachment_received", "attachment_sent"):
+            content_html = text
+        else:
+            content_html = html.escape(text) # Esegui l'escape per i messaggi normali
+
 
         # Font morbido per tutte le bolle
         bubble_font = "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif"
@@ -660,15 +713,15 @@ class ChatWidget(QtWidgets.QWidget):
 
         # Contenuto della bolla
         if mtype == "sent":
-            label = f"<b>Tu:</b> {escaped_text}"
+            label = f"<b>Tu:</b> {content_html}"
         elif mtype == "received":
-            label = f"<b>{html.escape(peer_display_id)}:</b> {escaped_text}"
+            label = f"<b>{html.escape(peer_display_id)}:</b> {content_html}"
         elif mtype == "attachment_sent":
-            label = f"Hai inviato: {escaped_text}"
+            label = f"Hai inviato: {html.escape(text)}"
         elif mtype == "attachment_received":
-            label = f"{html.escape(peer_display_id)} ha inviato: {escaped_text}"
+            label = f"{html.escape(peer_display_id)} ha inviato: {content_html}"
         else:
-            label = f"<i>{escaped_text}</i>"
+            label = f"<i>{content_html}</i>"
 
         # Costruzione HTML della bolla con bordo
         bubble_html = f"""
@@ -696,7 +749,6 @@ class ChatWidget(QtWidgets.QWidget):
         self.chat_area.append(bubble_html)
         self.chat_area.verticalScrollBar().setValue(self.chat_area.verticalScrollBar().maximum())
 
-    # Modificato per ricevere e usare l'UUID
     def handle_peer_connect(self, writer, peername, peer_uuid):
          ip, port = peername
          # Usa l'UUID fornito nel messaggio di info
@@ -793,12 +845,27 @@ class ChatWidget(QtWidgets.QWidget):
 
             # --- Gestione Allegati ---
             elif message_type == "attachment" and peer_info:
-                filename = payload.get("filename", "file sconosciuto")
-                mimetype = payload.get("mimetype", "")
+                filename = payload.get("filename", "file_sconosciuto")
+                mimetype = payload.get("mimetype", "application/octet-stream")
+                base64_data = payload.get("data")
                 translation = payload.get("translation", None)
-                # ... (logica dati) ...
-                message_info = f"{filename} ({mimetype})"
-                if translation: message_info += f"<br><i>Traduzione:</i> {html.escape(translation)}"
+
+                if not base64_data:
+                    logging.warning(f"Ricevuto allegato da {peer_display_id} senza dati.")
+                    return
+
+                # Genera un ID unico per questo file e memorizzalo
+                file_uuid = str(uuid.uuid4())
+                print(f"DEBUG: Generato UUID per il link: '{file_uuid}'")
+                self.pending_files[file_uuid] = {"filename": filename, "data": base64_data}
+
+                # Prepara il messaggio HTML con il link per il salvataggio
+                download_link = f'<a href="{file_uuid}" style="color: #87CEEB; text-decoration: none;"><b>Clicca qui per salvare {html.escape(filename)}</b></a>'
+                
+                message_info = f"({mimetype})<br>{download_link}"
+                if translation:
+                    message_info += f"<br><br><i>Traduzione del contenuto:</i><br>{html.escape(translation)}"
+                
                 # Passa peer_display_id
                 self.display_message(message_info, "attachment_received", peer_display_id)
 
@@ -818,7 +885,7 @@ class ChatWidget(QtWidgets.QWidget):
 
 
     def send_public_key(self, target_writer):
-         # ... (log aggiornato con UUID) ...
+         # ... (log con UUID) ...
          if target_writer and not target_writer.is_closing():
              peer_info = self.peer_crypto_info.get(target_writer)
              peer_display_id = f"Peer-{peer_info['uuid']}" if peer_info and 'uuid' in peer_info else "Peer Sconosciuto"
@@ -887,7 +954,6 @@ class ChatWidget(QtWidgets.QWidget):
 
 
     def connect_peer(self):
-        # ... (logica e validazione invariata) ...
         ip = self.peer_ip_input.text().strip()
         port_text = self.peer_port_input.text().strip()
         if not ip or not port_text: self.display_message("Inserisci IP e Porta del peer.", "info"); return
@@ -940,7 +1006,6 @@ class ChatWidget(QtWidgets.QWidget):
                 payload = {"type": "typing_status", "status": "not_typing"}
                 asyncio.run_coroutine_threadsafe(self.node.send_message(json.dumps(payload), self.current_writer), self.loop)
         self.typing_timer.stop()
-
 
 ########################################################################
 # INTERFACCIA: Sidebar Animata (AnimatedDockWidget)
@@ -1109,7 +1174,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_info(self):
         
         info_text = (
-            "<b>ChatProP2P</b><br><br>" # Modificato titolo
+            "<b>ChatProP2P</b><br><br>"
             "Applicazione di chat peer-to-peer con interfaccia moderna, temi personalizzabili e funzionalità avanzate.<br><br>"
             "<b>Crittografia End-to-End</b>: Utilizza lo scambio di chiavi X25519 e il protocollo Double Ratchet.<br>"
             "<b>Double Ratchet</b>: Forward Secrecy e Post-Compromise Security.<br>"
@@ -1132,7 +1197,7 @@ class MainWindow(QtWidgets.QMainWindow):
                  try:
                      writer.close()
                      # Considera await writer.wait_closed() se possibile/necessario,
-                     # ma potrebbe bloccare la chiusura della UI.
+                     # potrebbe bloccare la chiusura della UI.
                  except Exception as e:
                      logging.warning(f"Errore durante la chiusura del writer: {e}")
 
