@@ -3,5 +3,5 @@ Generare il file eseguibile : pyinstaller --onefile --windowed main.py
 Avvia da terminale il server per l'osservatore: python main.py
 Dettagli Ip : ipconfig
 Avviare il browser peer : python app.py 
-Installare Librerie: pip install PyQt5 - pip install pyinstaller - pip install cryptography - pip install aiohttp 
+Installare Librerie: pip install PyQt5 - pip install pyinstaller - pip install cryptography - pip install aiohttp - pip install googletrans-py
 Ambiente : python -m venv venv  -->  venv\Scripts\activate .
